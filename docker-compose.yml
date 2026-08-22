@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16
+    container_name: fraud_pg
+    environment:
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud
+      POSTGRES_DB: fraud
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 590k rows with per-card window functions means large sorts. Defaults
+    # (shared_buffers=128MB, work_mem=4MB) would spill those sorts to disk.
+    # max_wal_size: the migrations rewrite ~1.5GB tables; at the 1GB default
+    # Postgres logged "checkpoints are occurring too frequently (16 seconds
+    # apart)" and a backend died under the resulting I/O pressure on WSL2.
+    command: postgres -c shared_buffers=1GB -c work_mem=256MB -c max_wal_size=4GB
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d fraud"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
