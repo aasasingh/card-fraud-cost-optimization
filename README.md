@@ -1,180 +1,151 @@
-# Card fraud detection on IEEE-CIS, cost-first
+# Card fraud detection on IEEE-CIS, measured in dollars
 
-Transaction fraud detection built as a cost-minimization problem, not a
-classification benchmark: SQL feature engineering over a reconstructed card
-identity, an explainable rules baseline, a LightGBM model, and an explicit
-dollar cost matrix that both are judged on. Every number below is printed by
-`make run`.
+<!-- Add a sentence or two here about why you built this, in your own words. -->
 
-## Result
+This project builds a fraud screening policy for card transactions and evaluates it by total dollar cost instead of accuracy or AUC. It uses the IEEE-CIS Fraud Detection dataset from Kaggle[^1], PostgreSQL for data prep and feature engineering, a rules-based baseline, and a calibrated LightGBM model.
 
-On the test fold (final ~15% of the timeline, 88,581 transactions, never
-touched during training or threshold selection):
+> [!NOTE]
+> Every number in this README is printed by `make run`. See [How to run it](#how-to-run-it).
 
-| policy | test cost | vs doing nothing |
+## Contents
+
+- [Results](#results)
+- [Cost assumptions](#cost-assumptions)
+- [Findings](#findings)
+- [Limitations](#limitations)
+- [Next steps](#next-steps)
+- [How to run it](#how-to-run-it)
+- [Project structure](#project-structure)
+
+## Results
+
+The test set is the last ~15% of the timeline (88,581 transactions). It wasn't used for training or for choosing thresholds.
+
+| Policy | Test cost | Change vs. no alerts |
 |---|---|---|
-| no alerts (eat every fraud) | $546,684 | — |
-| rules baseline + expected-value decisioning | $445,281 | −18.5% |
-| LightGBM + expected-value decisioning, calibrated | **$283,703** | **−48.1%** |
+| No alerts | $546,684 | |
+| Rules baseline | $445,281 | -18.5% |
+| LightGBM, calibrated | $283,703 | -48.1% |
 
-The model beats the rules baseline by **$161,578 (36% lower cost)**. At its
-operating point it raises 4,966 alerts over the ~31-day test window
-(precision 0.317, recall 0.511, **67.8% of fraud dollars**). Under a review
-capacity of 100 alerts/day, ranking by expected dollars (p × amount) puts
-59.1% of test-fold fraud dollars in front of a reviewer; 500/day reaches
-88.1%.
+Both the rules baseline and the model use the same expected-value decision rule, explained [below](#using-a-dollar-threshold-instead-of-a-probability-cutoff). The model's cost is $161,578 lower than the rules baseline, about 36%.
 
-Cost matrix (per transaction): true negative $0; true positive $2 (review);
-false positive $27 (review + $25 declined-customer friction); false negative
-amount + $25 (chargeback + dispute fee). The friction figure is the softest
-assumption and the results pivot on it — see limitations.
+At its operating point the model raised 4,966 alerts over the 31-day test window, roughly 160 a day. Precision was 0.317 and recall was 0.511, and the flagged transactions made up 67.8% of fraud dollars.
 
-## The decision rule is an amount threshold in disguise
+I also looked at what happens with a fixed review capacity. Ranking transactions by expected loss (probability × amount), 100 alerts a day covers 59.1% of fraud dollars in the test set, and 500 a day covers 88.1%.
 
-Sweeping a probability threshold is the textbook move, but with this cost
-matrix the optimal rule is `alert when p × (amount + 25) > 2 + (1 − p) × 25`,
-which rearranges to **`amount > 27/p − 50`** — a dollar bar per probability
-level, not a probability cutoff. For the rules baseline, whose score has
-four levels, the entire policy collapses to four fixed bars
-(`make baseline`):
+![Cost curve for the calibrated LightGBM model on the test set](results/cost_curve.png)
 
-| rules fired | train fraud rate | alert when amount exceeds |
+## Cost assumptions
+
+Each transaction gets a cost based on what happens to it:
+
+| Outcome | Cost |
+|---|---|
+| Legitimate, not flagged | $0 |
+| Fraud, flagged | $2 for a manual review |
+| Legitimate, flagged | $27 ($2 review plus $25 for the declined customer) |
+| Fraud, not flagged | Transaction amount plus a $25 dispute fee |
+
+> [!IMPORTANT]
+> The $25 customer friction cost is an estimate, and the results are sensitive to it. Changing it to $10 or $50 moves the model's test cost to $211,367 or $339,911. See [Limitations](#limitations).
+
+## Findings
+
+### Using a dollar threshold instead of a probability cutoff
+
+The usual approach is to pick a probability cutoff and flag everything above it. With the costs above, the cheapest decision for a single transaction is to flag it when
+
+```
+p × (amount + 25) > 2 + (1 − p) × 25
+```
+
+which simplifies to `amount > 27/p − 50`. So the rule is a dollar threshold that depends on the predicted probability. A transaction with a low fraud probability can still be worth reviewing if the amount is high enough.
+
+This matters on this dataset because fraud isn't concentrated in large purchases. The 99th percentile fraud amount is $994, which is lower than the 99th percentile for legitimate transactions ($1,104). A probability cutoff can't reach low-probability, high-amount transactions, and that's where a lot of the loss is. For the rules baseline, switching from a swept probability cutoff to the expected-value rule lowered test cost by $52,895.
+
+Since the rules score only has four levels, the baseline policy comes down to four dollar thresholds (`make baseline`):
+
+| Rules fired | Train fraud rate | Alert when amount exceeds |
 |---|---|---|
 | 0 | 0.034 | $748 |
 | 1 | 0.065 | $365 |
 | 2 | 0.133 | $152 |
 | 3+ | 0.133 (pooled) | $152 |
 
-The rules don't decide anything by themselves — they select which bar
-applies, and the amount does the discriminating. On the test fold this
-expected-value form beats the swept-threshold form of the *same* rules by
-$52,895, and the gap exists because fraud amounts here are not concentrated
-in big tickets (fraud p99 is $994, *below* the legitimate p99 of $1,104), so
-no probability cutoff can reach the low-probability/high-amount rows that
-dominate the loss. The score→probability map is monotone by construction:
-thin cells are collapsed and pool-adjacent-violators is applied, after the
-first fit produced a 4-row cell with p = 0 (a permanent never-alert) and a
-45-row cell that gave a higher score a higher dollar bar.
+The rules pick which threshold applies, and the amount decides the rest.
 
-## The entity key: measured, not assumed
+The first time I fit the score-to-probability mapping, a cell with only 4 rows got p = 0, which meant it would never alert. A 45-row cell also gave a higher score a higher dollar threshold. I fixed both by merging small cells and applying pool-adjacent-violators so the mapping is monotone.
 
-The dataset has no card ID. The first reconstruction —
-`card1..card6 | addr1 | P_emaildomain` — produced 94,873 keys whose
-distribution is **bimodal** (`make profile`): median 2 transactions per key,
-but the top key held 4,002 transactions across all 182 days at a
-near-base-rate fraud rate — a pooled cohort, not a card. The largest 100
-keys held 13.3% of all transactions.
+### Rebuilding the card ID
 
-Root cause, quantified: addr1 is 11.1% null, and null-collapse pools
-distinct cards under one key. Keys with null addr1 carry 22.0% of their
-transactions in 1,000+-transaction mega-keys versus 3.1% for keys with an
-address — plus residual pooling from common BIN combinations.
+The dataset doesn't include a card ID, so one has to be reconstructed for the velocity features. My first version combined `card1` to `card6`, `addr1`, and `P_emaildomain`. That gave 94,873 keys, but the distribution was bimodal (`make profile`). The median key had 2 transactions, while the largest had 4,002 transactions across all 182 days, with a fraud rate close to the overall average. That key was clearly many cards grouped together. The 100 largest keys held 13.3% of all transactions.
 
-The fix appends `day − D1` to the key. D1's meaning is deliberately not
-assumed (the D columns are anonymized); instead one property was tested:
-within a key, `day − D1` is either **exactly constant** (12,756 of 27,232
-small keys) **or spread over months** (11,226 keys) — a range of exactly 1
-day, the signature of rounding jitter splitting real cards, occurs 173
-times. That bimodal signature is what a stable per-entity constant mixed
-across pooled entities looks like, and constancy plus discriminative power
-is all a key component needs. The refined key (278,270 entities) splits the
-4,002-transaction monster into 362 pieces with card-sized medians, and cuts
-the top-100-key share from 13.3% to 1.5% of transactions.
+Most of the problem came from missing addresses. `addr1` is null in 11.1% of rows, and the nulls let different cards share a key. Keys with a null `addr1` had 22.0% of their transactions in keys with 1,000+ transactions, compared with 3.1% for keys with an address. Common BIN combinations caused some pooling too.
 
-The honest cost: transactions with no prior history on their key — where
-velocity features are undefined — rise from 16.1% (v1) to **47.1%** (v2).
-Computing velocity over entities proven to be pools was judged worse than
-having no velocity at all for more rows.
+The fix was to add `day − D1` to the key.[^2] Within small keys, `day − D1` was either exactly constant (12,756 of 27,232 keys) or spread over months (11,226 keys). Only 173 keys had a range of exactly one day, which is what rounding would look like if it were splitting real cards. That pattern fits a value that stays fixed for each card and gets mixed when cards are pooled together.
 
-## A structurally zero-fraud rail exists, and it broke the rules
+The new key produces 278,270 entities. The 4,002-transaction key splits into 362 pieces with normal card-sized counts, and the top 100 keys drop from 13.3% to 1.5% of transactions.
 
-Eleven keys with ≥100 transactions carry 3,107 transactions and **zero
-fraud** — the base rate predicts ~109. They are automated traffic, not
-shoppers: one key runs 1,414 transactions in 52 days at a median gap of 12
-*seconds* (ProductCD S, 100% identity coverage); the others are
-recurring-billing-shaped (fixed amounts on ~daily cadence, ProductCD W).
-Seven survive into the test window.
+The downside is that more transactions now have no earlier history on their key, so velocity features are undefined for them: 47.1% of rows, up from 16.1%. I decided that was better than computing velocity over keys I knew were pooled.
 
-The rules baseline cannot tell this rail from a fraud burst: its
-probability-threshold form flags 1,354 rail rows on test — $36,558 of
-guaranteed false positives, 31% of its alert budget. The model produces
-**zero** rail false positives at every operating point, and not merely
-because the amount bar excludes them: its mean calibrated probability on the
-rail's 3,107 rows is 0.0024, against a population mean of 0.0403. It learned
-the behaviour is safe.
+### Automated traffic with no fraud
 
-## What the SQL feature layer bought the model: nothing, within noise
+Eleven keys with at least 100 transactions each have 3,107 transactions combined and no fraud. At the base rate you'd expect about 109. These look automated. One key has 1,414 transactions over 52 days with a median gap of 12 seconds (ProductCD S, full identity coverage). The others look like recurring billing, with fixed amounts on a roughly daily schedule (ProductCD W). Seven of the eleven are still active in the test period.
 
-Retraining identically with the six engineered features removed changes the
-test EV cost by **−$1,653 at seed 42 and −$750 at seed 43** (negative =
-removing them helped), while the full model's own seed-to-seed spread is
-$4,891. The measured contribution of the entire Postgres velocity layer to
-model cost is zero within training noise — an earlier single-seed run
-showed +$8,306 before the noise scale was measured, which is exactly why
-the ablation now runs at two seeds. The honest reading: C1–C14 are the
-vendor's own counting features and D1–D15 its timedeltas, computed with
-access to the *true* card identity — our velocity features reconstruct
-approximately what the vendor already computed exactly, and `c14` and `d2`
-sit in the model's top-10 gains. The Postgres layer's demonstrated value is
-operational, not predictive: an explainable rules tier, dollar bars, the
-split/leakage audit trail, and the entity-key analysis itself.
+The rules baseline treats this traffic like a fraud burst. With a probability cutoff, it flags 1,354 of these transactions in the test set, which is $36,558 in false positives and 31% of its alerts. The model doesn't flag any of them at any operating point. That isn't only because of the dollar threshold. The model's average calibrated probability on these 3,107 transactions is 0.0024, compared with 0.0403 across all transactions.
+
+### The SQL features did not improve the model
+
+I built six velocity features in Postgres. To check whether they helped, I retrained the model without them. Test cost went down by $1,653 at seed 42 and by $750 at seed 43, so the model did slightly better without them. On its own, the model's cost varies by $4,891 between seeds, so the difference is within noise.
+
+An earlier single-seed run showed the features saving $8,306. That was before I had measured the variation between seeds, and it's why the ablation now runs on two seeds.
+
+The most likely reason is that the dataset already includes the vendor's count features (C1-C14) and timedeltas (D1-D15), which were computed using the real card identity. My features approximate the same information with a reconstructed key. `c14` and `d2` are both in the model's top 10 features by gain.
+
+The Postgres layer is still used for the rules baseline, the dollar thresholds, the train/test split and leakage checks, and the card key analysis above. It just doesn't add predictive value to the model.
 
 ## Limitations
 
-- **Calibration.** Raw model probabilities were badly miscalibrated even
-  after analytically inverting the `scale_pos_weight` prior shift
-  (validation deciles ran 1.8×–12.1× too low — shape-dependent, worst on
-  easy negatives, i.e. genuine boosting overconfidence rather than an
-  inversion bug). Isotonic regression fit on validation fixed the deciles
-  and was worth $22,505 on test — the expected-value rule reads absolute
-  probabilities, so calibration is a correctness requirement. The swept
-  p-threshold, invariant to monotone recalibration, moved by $392.
-- **Friction sensitivity.** Moving the declined-customer cost across
-  $10/$25/$50 moves the model's test EV cost across
-  $211,367 / $283,703 / $339,911 and roughly halves-to-doubles alert
-  volume. The single softest business assumption owns a ~$129k swing.
-- **Temporal decay.** The operating point and calibration both come from
-  the validation month and are applied one month later; the capacity view
-  shows the drift directly (fraud-dollar capture at 100 alerts/day:
-  65.2% on validation, 59.1% on test).
-- **Training noise.** LightGBM results move ~$5k between seeds and were
-  order-sensitive until row order was pinned (`ORDER BY transactionid`);
-  cost deltas smaller than that spread — the ablation above — are noise,
-  and are labeled as such rather than claimed.
-- **The top features are anonymized.** `v258`, `v294`, `c14` lead the gain
-  ranking; nobody can say what they measure. The model is an empirical
-  artifact of this dataset, not a portable fraud theory.
-- **Residual entity noise.** The refined key still has a 1,414-transaction
-  head entity; 0.21% of rows lack D1 and fall back to coarse identity;
-  same-second peers make trailing windows fuzzy for 0.02% of rows.
-- **`day − D1` constancy is demonstrated; its meaning is not.** No claim
-  about what D1 is survives in this repo, only the measured property.
+- **Calibration.** The raw LightGBM probabilities were too low by 1.8 to 12.1 times across validation deciles, even after correcting for `scale_pos_weight`. The error was worst on easy negatives, which points to boosting overconfidence rather than a bug in the correction. Isotonic regression fit on the validation set fixed the deciles and lowered test cost by $22,505. Calibration is required here because the decision rule uses the probability values directly. A swept probability cutoff only changed by $392, since it depends on ranking alone.
+- **Customer friction cost.** Setting it to $10, $25, or $50 gives a test cost of $211,367, $283,703, or $339,911. That's a range of about $129K from one assumption, and alert volume roughly halves or doubles with it.
+- **Drift.** The operating point and calibration are fit on the validation month and applied to the next month. At 100 alerts a day, fraud dollar coverage drops from 65.2% on validation to 59.1% on test.
+- **Seed noise.** Results vary by about $5K between seeds. They also depended on row order until I added `ORDER BY transactionid`. Differences smaller than that are treated as noise.
+- **Anonymized features.** The top features by gain are `v258`, `v294`, and `c14`, and it's not known what they measure. The model is specific to this dataset.
+- **Remaining key issues.** The refined key still has one entity with 1,414 transactions. 0.21% of rows have no D1 and fall back to the coarser key, and transactions in the same second make trailing windows slightly off for 0.02% of rows.
 
-## Reproduce
+## Next steps
 
-Requires Docker and the two Kaggle files
-([IEEE-CIS Fraud Detection](https://www.kaggle.com/c/ieee-fraud-detection/data))
-placed in `data/raw/`: `train_transaction.csv`, `train_identity.csv`.
+<!-- These are suggestions based on the limitations. Edit or replace them with your own plans. -->
 
-```
+- [ ] Replace the $25 friction estimate with a number based on real data, or report results across a range
+- [ ] Recalibrate monthly and measure how quickly performance drifts
+- [ ] Test whether the velocity features help when the vendor's C and D columns are removed
+
+## How to run it
+
+You need Docker, plus `train_transaction.csv` and `train_identity.csv` from Kaggle[^1] placed in `data/raw/`.
+
+```bash
 docker compose up -d
-make setup     # venv + deps + Postgres 16 healthy
-make run       # load -> migrate -> profile -> baseline -> model
+make setup   # virtualenv, dependencies, and Postgres 16
+make run     # load, migrate, profile, baseline, model
 ```
 
-`make run` prints every number in this README: dataset profile and entity
-key validation (`profile`), rules baseline with fitted thresholds and
-dollar bars (`baseline`), model with calibration, ablation, capacity view,
-friction sensitivity, and the cost curve at `results/cost_curve.png`
-(`model`). The full-teardown check (`docker compose down -v`, rebuild)
-reproduced the profile byte-for-byte.
+`make run` prints every number in this README and saves the cost curve to [`results/cost_curve.png`](results/cost_curve.png). You can also run `make profile` or `make baseline` on their own. See the [`Makefile`](Makefile) and [`docker-compose.yml`](docker-compose.yml) for details.
 
-```
-data/raw/     gitignored Kaggle CSVs
-sql/          numbered migrations: typed cast, entity keys, features, split
-src/          load.py, migrate.py, profile.py, baseline.py, model.py, evaluate.py
-results/      cost curve plot
-```
+After a full teardown (`docker compose down -v`) and rebuild, the profile output matched byte for byte.
 
-Stack: Python 3.11, Postgres 16 (Docker), psycopg2/SQLAlchemy, pandas,
-LightGBM, scikit-learn, matplotlib.
+## Project structure
+
+| Path | Contents |
+|---|---|
+| [`sql/`](sql/) | Numbered migrations: type casting, entity keys, features, train/test split |
+| [`src/`](src/) | `load.py`, `migrate.py`, `profile.py`, `baseline.py`, `model.py`, `evaluate.py` |
+| [`results/`](results/) | Cost curve plot |
+| `data/raw/` | Kaggle CSVs (not committed) |
+
+Stack: Python 3.11, PostgreSQL 16 in Docker, psycopg2 and SQLAlchemy, pandas, LightGBM, scikit-learn, matplotlib.
+
+[^1]: [IEEE-CIS Fraud Detection](https://www.kaggle.com/c/ieee-fraud-detection/data) on Kaggle. You need a Kaggle account and have to accept the competition rules to download the data.
+
+[^2]: The competition only describes D1-D15 as timedeltas, without saying exactly what each one measures. I only rely on the property I measured here, that `day − D1` stays constant within a card. I'm not claiming to know what D1 represents.
